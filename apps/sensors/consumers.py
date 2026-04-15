@@ -7,6 +7,7 @@ from urllib.parse import parse_qs
 from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
+from apps.plants.services import get_or_create_control_config
 
 from apps.sensors.models import HumidityReading, SystemState
 
@@ -41,6 +42,20 @@ def get_device_tokens() -> set[str]:
 def is_valid_device(secret: str | None) -> bool:
     return bool(secret and secret in get_device_tokens())
 
+@sync_to_async
+def get_control_snapshot():
+    config = get_or_create_control_config()
+    plant = config.selected_plant
+
+    return {
+        "auto_mode": config.auto_mode,
+        "manual_override": config.manual_override,
+        "motor_enabled": config.motor_enabled,
+        "plant_id": plant.id if plant else None,
+        "plant_name": plant.name if plant else None,
+        "soil_min": plant.ideal_soil_moisture_min if plant else None,
+        "soil_max": plant.ideal_soil_moisture_max if plant else None,
+    }
 
 @sync_to_async
 def create_reading(value: float, source: str):
@@ -55,6 +70,7 @@ def get_latest_reading():
 async def get_latest_reading_payload():
     latest = await get_latest_reading()
     motor_state = await get_motor_state()
+    control = await get_control_snapshot()
 
     if not latest:
         return {
@@ -65,6 +81,12 @@ async def get_latest_reading_payload():
                 "timestamp": None,
             },
             "motor_state": motor_state,
+            "control": {
+                "auto_mode": control["auto_mode"],
+                "plant_name": control["plant_name"],
+                "soil_min": control["soil_min"],
+                "soil_max": control["soil_max"],
+            },
         }
 
     return {
@@ -75,6 +97,12 @@ async def get_latest_reading_payload():
             "timestamp": latest.created_at.isoformat(),
         },
         "motor_state": motor_state,
+        "control": {
+            "auto_mode": control["auto_mode"],
+            "plant_name": control["plant_name"],
+            "soil_min": control["soil_min"],
+            "soil_max": control["soil_max"],
+        },
     }
 
 
@@ -174,8 +202,30 @@ class SensorConsumer(AsyncWebsocketConsumer):
 
         source = (self.scope.get("client") or ["esp32"])[0]
         reading = await create_reading(value=value, source=source)
-        motor_state = await get_motor_state()
-
+        
+        control = await get_control_snapshot()
+        current_motor_state = await get_motor_state()
+        
+        next_motor_state = current_motor_state
+        
+        if (
+            control["auto_mode"]
+            and not control["manual_override"]
+            and control["motor_enabled"]
+            and control["plant_id"] is not None
+        ):
+            soil_min = control["soil_min"]
+            soil_max = control["soil_max"]
+        
+            if soil_min is not None and value < soil_min:
+                next_motor_state = True
+            elif soil_max is not None and value >= soil_max:
+                next_motor_state = False
+        
+            if next_motor_state != current_motor_state:
+                await set_motor_state(next_motor_state)
+                await self.broadcast_motor_state(next_motor_state)
+        
         out = {
             "type": "reading",
             "data": {
@@ -183,7 +233,13 @@ class SensorConsumer(AsyncWebsocketConsumer):
                 "source": reading.source,
                 "timestamp": reading.created_at.isoformat(),
             },
-            "motor_state": motor_state,
+            "motor_state": next_motor_state,
+            "control": {
+                "auto_mode": control["auto_mode"],
+                "plant_name": control["plant_name"],
+                "soil_min": control["soil_min"],
+                "soil_max": control["soil_max"],
+            },
         }
 
         await self.channel_layer.group_send(

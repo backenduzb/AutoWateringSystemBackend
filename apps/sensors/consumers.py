@@ -8,20 +8,29 @@ from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
 
-from apps.sensors.models import HumidityReading
+from apps.sensors.models import HumidityReading, SystemState
 
 GROUP_UPDATES = "humidity_updates"
 GROUP_DEVICES = "esp32_devices"
 
-_motor_state = {"value": False}
 
-
+@sync_to_async
 def get_motor_state() -> bool:
-    return _motor_state["value"]
+    obj, _ = SystemState.objects.get_or_create(
+        key="motor_state",
+        defaults={"value": "false"},
+    )
+    return obj.value.lower() == "true"
 
 
+@sync_to_async
 def set_motor_state(value: bool) -> bool:
-    _motor_state["value"] = value
+    obj, _ = SystemState.objects.get_or_create(
+        key="motor_state",
+        defaults={"value": "false"},
+    )
+    obj.value = "true" if value else "false"
+    obj.save(update_fields=["value", "updated_at"])
     return value
 
 
@@ -39,8 +48,14 @@ def create_reading(value: float, source: str):
 
 
 @sync_to_async
-def get_latest_reading_payload():
-    latest = HumidityReading.objects.order_by("-created_at").first()
+def get_latest_reading():
+    return HumidityReading.objects.order_by("-created_at").first()
+
+
+async def get_latest_reading_payload():
+    latest = await get_latest_reading()
+    motor_state = await get_motor_state()
+
     if not latest:
         return {
             "type": "reading",
@@ -49,7 +64,7 @@ def get_latest_reading_payload():
                 "source": None,
                 "timestamp": None,
             },
-            "motor_state": get_motor_state(),
+            "motor_state": motor_state,
         }
 
     return {
@@ -59,7 +74,7 @@ def get_latest_reading_payload():
             "source": latest.source,
             "timestamp": latest.created_at.isoformat(),
         },
-        "motor_state": get_motor_state(),
+        "motor_state": motor_state,
     }
 
 
@@ -115,14 +130,7 @@ class SensorConsumer(AsyncWebsocketConsumer):
         try:
             payload = json.loads(text_data)
         except json.JSONDecodeError:
-            await self.send(
-                text_data=json.dumps(
-                    {
-                        "type": "error",
-                        "message": "invalid_json",
-                    }
-                )
-            )
+            await self.send(text_data=json.dumps({"type": "error", "message": "invalid_json"}))
             return
 
         msg_type = payload.get("type")
@@ -136,17 +144,13 @@ class SensorConsumer(AsyncWebsocketConsumer):
             if command not in {"ON", "OFF"}:
                 await self.send(
                     text_data=json.dumps(
-                        {
-                            "type": "error",
-                            "message": "invalid_command",
-                            "valid_commands": ["ON", "OFF"],
-                        }
+                        {"type": "error", "message": "invalid_command", "valid_commands": ["ON", "OFF"]}
                     )
                 )
                 return
 
             new_state = command == "ON"
-            set_motor_state(new_state)
+            await set_motor_state(new_state)
             await self.broadcast_motor_state(new_state)
 
             await self.send(
@@ -165,18 +169,12 @@ class SensorConsumer(AsyncWebsocketConsumer):
         try:
             value = float(raw_value)
         except (TypeError, ValueError):
-            await self.send(
-                text_data=json.dumps(
-                    {
-                        "type": "error",
-                        "message": "value_must_be_numeric",
-                    }
-                )
-            )
+            await self.send(text_data=json.dumps({"type": "error", "message": "value_must_be_numeric"}))
             return
 
         source = (self.scope.get("client") or ["esp32"])[0]
         reading = await create_reading(value=value, source=source)
+        motor_state = await get_motor_state()
 
         out = {
             "type": "reading",
@@ -185,7 +183,7 @@ class SensorConsumer(AsyncWebsocketConsumer):
                 "source": reading.source,
                 "timestamp": reading.created_at.isoformat(),
             },
-            "motor_state": get_motor_state(),
+            "motor_state": motor_state,
         }
 
         await self.channel_layer.group_send(
@@ -223,7 +221,7 @@ class SensorConsumer(AsyncWebsocketConsumer):
             text_data=json.dumps(
                 {
                     "type": "motor_state",
-                    "motor_state": get_motor_state(),
+                    "motor_state": await get_motor_state(),
                     "timestamp": datetime.now().isoformat(),
                 }
             )
@@ -273,7 +271,7 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
             text_data=json.dumps(
                 {
                     "type": "motor_state",
-                    "motor_state": get_motor_state(),
+                    "motor_state": await get_motor_state(),
                     "timestamp": datetime.now().isoformat(),
                 }
             )
@@ -285,25 +283,18 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
     async def receive(self, text_data=None, bytes_data=None):
         if not text_data:
             return
-    
+
         try:
             payload = json.loads(text_data)
         except json.JSONDecodeError:
-            await self.send(
-                text_data=json.dumps(
-                    {
-                        "type": "error",
-                        "message": "invalid_json",
-                    }
-                )
-            )
+            await self.send(text_data=json.dumps({"type": "error", "message": "invalid_json"}))
             return
-    
+
         if payload.get("type") == "motor_applied":
             applied_state = bool(payload.get("motor_state", False))
-            set_motor_state(applied_state)
+            await set_motor_state(applied_state)
             timestamp = datetime.now().isoformat()
-    
+
             await self.channel_layer.group_send(
                 GROUP_UPDATES,
                 {
@@ -312,7 +303,7 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                     "timestamp": timestamp,
                 },
             )
-    
+
             await self.send(
                 text_data=json.dumps(
                     {
@@ -323,35 +314,28 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 )
             )
             return
-    
+
         if payload.get("type") == "request_motor_state":
             await self.send(
                 text_data=json.dumps(
                     {
                         "type": "motor_state",
-                        "motor_state": get_motor_state(),
+                        "motor_state": await get_motor_state(),
                         "timestamp": datetime.now().isoformat(),
                     }
                 )
             )
             return
-    
+
         command = str(payload.get("command", "")).upper()
         if command not in {"ON", "OFF"}:
-            await self.send(
-                text_data=json.dumps(
-                    {
-                        "type": "error",
-                        "message": "invalid_command",
-                    }
-                )
-            )
+            await self.send(text_data=json.dumps({"type": "error", "message": "invalid_command"}))
             return
-    
+
         new_state = command == "ON"
-        set_motor_state(new_state)
+        await set_motor_state(new_state)
         timestamp = datetime.now().isoformat()
-    
+
         await self.channel_layer.group_send(
             GROUP_DEVICES,
             {
@@ -361,7 +345,7 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 "timestamp": timestamp,
             },
         )
-    
+
         await self.channel_layer.group_send(
             GROUP_UPDATES,
             {
@@ -370,7 +354,7 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 "timestamp": timestamp,
             },
         )
-    
+
         await self.send(
             text_data=json.dumps(
                 {

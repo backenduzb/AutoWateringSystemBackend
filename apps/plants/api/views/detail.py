@@ -1,5 +1,5 @@
 from rest_framework import generics, status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -16,11 +16,11 @@ class PlantListCreateView(generics.ListCreateAPIView):
 class PlantDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = PlantProfile.objects.all()
     serializer_class = PlantProfileSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
 
 class ControlConfigView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def get_object(self):
         obj, _ = ControlConfig.objects.get_or_create(

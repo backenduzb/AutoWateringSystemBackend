@@ -12,9 +12,6 @@ python manage.py migrate --noinput
 echo "👤 Creating admin user (if not exists)..."
 python manage.py createadmin
 
-echo "📁 Collecting static files..."
-python manage.py collectstatic --noinput
-
 echo "🚀 Starting Gunicorn server..."
 exec gunicorn core.asgi:application \
     -k uvicorn.workers.UvicornWorker \

@@ -2,17 +2,14 @@
 
 set -e
 
-# Django settings modulini set qilish
 export DJANGO_SETTINGS_MODULE=core.settings
 
 echo "📦 Running migrations..."
 python manage.py makemigrations --noinput
 python manage.py migrate --noinput
 
-echo "👤 Creating admin user (if not exists)..."
 python manage.py createadmin
 
-echo "🚀 Starting Gunicorn server..."
 exec gunicorn core.asgi:application \
     -k uvicorn.workers.UvicornWorker \
     --bind 0.0.0.0:8000 \

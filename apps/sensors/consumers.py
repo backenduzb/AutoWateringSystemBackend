@@ -4,40 +4,54 @@ import json
 from datetime import datetime
 from urllib.parse import parse_qs
 
-from apps.sensors.models import HumidityReading
 from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
-from channels.layers import get_channel_layer
 from django.conf import settings
 
-GROUP_NAME = "humidity"
-ESP32_GROUP_NAME = "esp32_devices"
+from apps.sensors.models import HumidityReading
 
-_motor_state = {"state": False}
+GROUP_UPDATES = "humidity_updates"
+GROUP_DEVICES = "esp32_devices"
 
-
-def get_motor_state():
-    return _motor_state["state"]
+_motor_state = {"value": False}
 
 
-def set_motor_state(state: bool):
-    _motor_state["state"] = state
-    return state
+def get_motor_state() -> bool:
+    return _motor_state["value"]
+
+
+def set_motor_state(value: bool) -> bool:
+    _motor_state["value"] = value
+    return value
+
+
+def get_device_tokens() -> set[str]:
+    return set(getattr(settings, "TELEMETRY_DEVICE_TOKENS", []))
+
+
+def is_valid_device(secret: str | None) -> bool:
+    return bool(secret and secret in get_device_tokens())
 
 
 @sync_to_async
-def _create_reading(value: float, source: str) -> HumidityReading:
+def create_reading(value: float, source: str):
     return HumidityReading.objects.create(value=value, source=source)
 
 
 @sync_to_async
-def _get_latest_payload():
+def get_latest_reading_payload():
     latest = HumidityReading.objects.order_by("-created_at").first()
     if not latest:
         return {
             "type": "reading",
-            "data": {"value": None, "source": None, "timestamp": None},
+            "data": {
+                "value": None,
+                "source": None,
+                "timestamp": None,
+            },
+            "motor_state": get_motor_state(),
         }
+
     return {
         "type": "reading",
         "data": {
@@ -45,6 +59,7 @@ def _get_latest_payload():
             "source": latest.source,
             "timestamp": latest.created_at.isoformat(),
         },
+        "motor_state": get_motor_state(),
     }
 
 
@@ -55,29 +70,23 @@ class UpdatesConsumer(AsyncWebsocketConsumer):
             await self.close(code=4401)
             return
 
+        await self.channel_layer.group_add(GROUP_UPDATES, self.channel_name)
         await self.accept()
-        await self.channel_layer.group_add(GROUP_NAME, self.channel_name)
-
-        payload = await _get_latest_payload()
-        payload["motor_state"] = get_motor_state()
-
-        await self.send(text_data=json.dumps(payload))
+        await self.send(text_data=json.dumps(await get_latest_reading_payload()))
 
     async def disconnect(self, code):
-        await self.channel_layer.group_discard(GROUP_NAME, self.channel_name)
+        await self.channel_layer.group_discard(GROUP_UPDATES, self.channel_name)
 
     async def humidity_reading(self, event):
-        event["payload"]["motor_state"] = get_motor_state()
         await self.send(text_data=json.dumps(event["payload"]))
 
-    async def motor_state_update(self, event):
-        """Motor state yangilanishini web dashboardga yuborish"""
+    async def motor_state_message(self, event):
         await self.send(
             text_data=json.dumps(
                 {
                     "type": "motor_state",
-                    "motor_state": event["state"],
-                    "timestamp": event.get("timestamp", datetime.now().isoformat()),
+                    "motor_state": event["motor_state"],
+                    "timestamp": event["timestamp"],
                 }
             )
         )
@@ -85,21 +94,19 @@ class UpdatesConsumer(AsyncWebsocketConsumer):
 
 class SensorConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        query = parse_qs(self.scope.get("query_string", b"").decode("utf-8"))
+        query = parse_qs(self.scope.get("query_string", b"").decode())
         secret = query.get("secret", [None])[0]
-        allowed = set(getattr(settings, "TELEMETRY_DEVICE_TOKENS", []))
 
-        if not secret or secret not in allowed:
+        if not is_valid_device(secret):
             await self.close(code=4403)
             return
 
+        await self.channel_layer.group_add(GROUP_DEVICES, self.channel_name)
         await self.accept()
-        await self.channel_layer.group_add(ESP32_GROUP_NAME, self.channel_name)
+        await self.send_current_motor_state()
 
-        # ESP32 ga joriy motor holatini yuborish
-        await self.send(
-            text_data=json.dumps({"type": "motor_state", "state": get_motor_state()})
-        )
+    async def disconnect(self, code):
+        await self.channel_layer.group_discard(GROUP_DEVICES, self.channel_name)
 
     async def receive(self, text_data=None, bytes_data=None):
         if not text_data:
@@ -108,63 +115,68 @@ class SensorConsumer(AsyncWebsocketConsumer):
         try:
             payload = json.loads(text_data)
         except json.JSONDecodeError:
-            await self.send(text_data=json.dumps({"error": "invalid json"}))
-            return
-
-        # ESP32 dan motor state so'rovi
-        if payload.get("type") == "request_motor_state":
             await self.send(
                 text_data=json.dumps(
-                    {"type": "motor_state", "state": get_motor_state()}
+                    {
+                        "type": "error",
+                        "message": "invalid_json",
+                    }
                 )
             )
             return
 
-        # Motor commandni qabul qilish (ESP32 dan kelishi mumkin)
-        if payload.get("type") == "motor_command":
-            command = payload.get("command", "").upper()
-            if command == "ON":
-                set_motor_state(True)
-                await self._broadcast_motor_state(True)
-                await self.send(
-                    text_data=json.dumps(
-                        {
-                            "status": "ok",
-                            "motor_state": True,
-                            "message": "Motor turned ON",
-                        }
-                    )
-                )
-            elif command == "OFF":
-                set_motor_state(False)
-                await self._broadcast_motor_state(False)
-                await self.send(
-                    text_data=json.dumps(
-                        {
-                            "status": "ok",
-                            "motor_state": False,
-                            "message": "Motor turned OFF",
-                        }
-                    )
-                )
-            else:
-                await self.send(
-                    text_data=json.dumps(
-                        {"error": "invalid command", "valid_commands": ["ON", "OFF"]}
-                    )
-                )
+        msg_type = payload.get("type")
+
+        if msg_type == "request_motor_state":
+            await self.send_current_motor_state()
             return
 
-        # Sensor ma'lumotlarini qabul qilish
-        raw = payload.get("value", payload.get("humidity"))
+        if msg_type == "motor_command":
+            command = str(payload.get("command", "")).upper()
+            if command not in {"ON", "OFF"}:
+                await self.send(
+                    text_data=json.dumps(
+                        {
+                            "type": "error",
+                            "message": "invalid_command",
+                            "valid_commands": ["ON", "OFF"],
+                        }
+                    )
+                )
+                return
+
+            new_state = command == "ON"
+            set_motor_state(new_state)
+            await self.broadcast_motor_state(new_state)
+
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "ack",
+                        "command": command,
+                        "motor_state": new_state,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
+            )
+            return
+
+        raw_value = payload.get("value", payload.get("humidity"))
         try:
-            value = float(raw)
+            value = float(raw_value)
         except (TypeError, ValueError):
-            await self.send(text_data=json.dumps({"error": "value must be numeric"}))
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "error",
+                        "message": "value_must_be_numeric",
+                    }
+                )
+            )
             return
 
         source = (self.scope.get("client") or ["esp32"])[0]
-        reading = await _create_reading(value=value, source=source)
+        reading = await create_reading(value=value, source=source)
 
         out = {
             "type": "reading",
@@ -173,103 +185,102 @@ class SensorConsumer(AsyncWebsocketConsumer):
                 "source": reading.source,
                 "timestamp": reading.created_at.isoformat(),
             },
+            "motor_state": get_motor_state(),
         }
 
         await self.channel_layer.group_send(
-            GROUP_NAME,
-            {"type": "humidity.reading", "payload": out},
-        )
-
-        await self.send(text_data=json.dumps({"status": "ok"}))
-
-    async def _broadcast_motor_state(self, state: bool):
-        """Motor holatini barcha mijozlarga yuborish"""
-        # Web dashboard uchun
-        await self.channel_layer.group_send(
-            GROUP_NAME,
+            GROUP_UPDATES,
             {
-                "type": "motor_state_update",
-                "state": state,
-                "timestamp": datetime.now().isoformat(),
+                "type": "humidity_reading",
+                "payload": out,
             },
-        )
-
-        # ESP32 uchun
-        await self.channel_layer.group_send(
-            ESP32_GROUP_NAME,
-            {
-                "type": "motor_command_to_esp32",
-                "command": "ON" if state else "OFF",
-                "state": state,
-            },
-        )
-
-    async def motor_command_to_esp32(self, event):
-        """ESP32 ga motor command yuborish"""
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        logger.info(
-            f"📤 Sending motor command to ESP32: command={event['command']}, state={event['state']}"
         )
 
         await self.send(
             text_data=json.dumps(
                 {
-                    "type": "motor_command",
-                    "command": event["command"],
-                    "state": event["state"],
+                    "type": "ack",
+                    "status": "ok",
+                    "timestamp": datetime.now().isoformat(),
                 }
             )
         )
 
-        logger.info(f"✅ Motor command sent to ESP32 WebSocket")
+    async def motor_command_message(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "motor_command",
+                    "command": event["command"],
+                    "motor_state": event["motor_state"],
+                    "timestamp": event["timestamp"],
+                }
+            )
+        )
+
+    async def send_current_motor_state(self):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "motor_state",
+                    "motor_state": get_motor_state(),
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+        )
+
+    async def broadcast_motor_state(self, state: bool):
+        timestamp = datetime.now().isoformat()
+
+        await self.channel_layer.group_send(
+            GROUP_UPDATES,
+            {
+                "type": "motor_state_message",
+                "motor_state": state,
+                "timestamp": timestamp,
+            },
+        )
+
+        await self.channel_layer.group_send(
+            GROUP_DEVICES,
+            {
+                "type": "motor_command_message",
+                "command": "ON" if state else "OFF",
+                "motor_state": state,
+                "timestamp": timestamp,
+            },
+        )
 
 
 class MotorControlConsumer(AsyncWebsocketConsumer):
-    """Web client to ESP32 motor control (Dashboard dan boshqarish)"""
-    """ESP32 ham shu endpoint ga ulanishi mumkin (secret token bilan)"""
-
     async def connect(self):
-        import logging
-        logger = logging.getLogger(__name__)
-
-        # Avval user authentication tekshirish
         user = self.scope.get("user")
-        is_authenticated = user and getattr(user, "is_authenticated", False)
+        is_user = bool(user and getattr(user, "is_authenticated", False))
 
-        # Agar user authenticate bo'lmagan bo'lsa, secret token tekshirish
-        if not is_authenticated:
-            query = parse_qs(self.scope.get("query_string", b"").decode("utf-8"))
-            secret = query.get("secret", [None])[0]
-            allowed = set(getattr(settings, "TELEMETRY_DEVICE_TOKENS", []))
+        query = parse_qs(self.scope.get("query_string", b"").decode())
+        secret = query.get("secret", [None])[0]
+        is_device = is_valid_device(secret)
 
-            if not secret or secret not in allowed:
-                logger.warning("❌ MotorControlConsumer: Authentication failed (no user or secret)")
-                await self.close(code=4401)
-                return
+        if not is_user and not is_device:
+            await self.close(code=4401)
+            return
+
+        if is_device:
+            await self.channel_layer.group_add(GROUP_DEVICES, self.channel_name)
 
         await self.accept()
-        logger.info("✅ MotorControlConsumer: Client connected")
-
-        # ESP32 ni motor guruhiga qo'shish
-        query = parse_qs(self.scope.get("query_string", b"").decode("utf-8"))
-        secret = query.get("secret", [None])[0]
-        if secret and secret in set(getattr(settings, "TELEMETRY_DEVICE_TOKENS", [])):
-            # Bu ESP32 device - uni guruhga qo'shamiz
-            await self.channel_layer.group_add(ESP32_GROUP_NAME, self.channel_name)
-            logger.info(f"📡 ESP32 device joined '{ESP32_GROUP_NAME}' group")
-            # Joriy motor holatini yuborish
-            await self.send(text_data=json.dumps({
-                "type": "motor_state",
-                "state": get_motor_state()
-            }))
-        else:
-            logger.info("🌐 Web dashboard client connected (no ESP32 secret)")
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "motor_state",
+                    "motor_state": get_motor_state(),
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+        )
 
     async def disconnect(self, code):
-        pass
+        await self.channel_layer.group_discard(GROUP_DEVICES, self.channel_name)
 
     async def receive(self, text_data=None, bytes_data=None):
         if not text_data:
@@ -278,50 +289,82 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
         try:
             payload = json.loads(text_data)
         except json.JSONDecodeError:
-            await self.send(text_data=json.dumps({"error": "invalid json"}))
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "error",
+                        "message": "invalid_json",
+                    }
+                )
+            )
             return
 
-        # ESP32 dan motor state so'rovi
         if payload.get("type") == "request_motor_state":
-            await self.send(text_data=json.dumps({
-                "type": "motor_state",
-                "state": get_motor_state()
-            }))
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "motor_state",
+                        "motor_state": get_motor_state(),
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
+            )
             return
 
-        command = payload.get("command", "").upper()
-
-        if command not in ["ON", "OFF"]:
-            await self.send(text_data=json.dumps({"error": "invalid command"}))
+        command = str(payload.get("command", "")).upper()
+        if command not in {"ON", "OFF"}:
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "error",
+                        "message": "invalid_command",
+                    }
+                )
+            )
             return
 
         new_state = command == "ON"
         set_motor_state(new_state)
+        timestamp = datetime.now().isoformat()
 
-        # ESP32 guruhiga komanda yuborish
         await self.channel_layer.group_send(
-            ESP32_GROUP_NAME,
-            {"type": "motor_command_to_esp32", "command": command, "state": new_state},
-        )
-
-        # Web dashboardga yangilanish yuborish
-        await self.channel_layer.group_send(
-            GROUP_NAME,
+            GROUP_DEVICES,
             {
-                "type": "motor_state_update",
-                "state": new_state,
-                "timestamp": datetime.now().isoformat(),
+                "type": "motor_command_message",
+                "command": command,
+                "motor_state": new_state,
+                "timestamp": timestamp,
             },
         )
 
-        # Frontend WebSocket clientiga javob yuborish
+        await self.channel_layer.group_send(
+            GROUP_UPDATES,
+            {
+                "type": "motor_state_message",
+                "motor_state": new_state,
+                "timestamp": timestamp,
+            },
+        )
+
         await self.send(
             text_data=json.dumps(
                 {
-                    "status": "ok",
+                    "type": "ack",
                     "command": command,
                     "motor_state": new_state,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": timestamp,
+                }
+            )
+        )
+
+    async def motor_command_message(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "motor_command",
+                    "command": event["command"],
+                    "motor_state": event["motor_state"],
+                    "timestamp": event["timestamp"],
                 }
             )
         )

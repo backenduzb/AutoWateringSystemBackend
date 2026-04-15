@@ -276,6 +276,17 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 }
             )
         )
+    async def motor_command_message(self, event):
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "motor_command",
+                        "command": event["command"],
+                        "motor_state": event["motor_state"],
+                        "timestamp": event["timestamp"],
+                    }
+                )
+            )
 
     async def disconnect(self, code):
         await self.channel_layer.group_discard(GROUP_DEVICES, self.channel_name)

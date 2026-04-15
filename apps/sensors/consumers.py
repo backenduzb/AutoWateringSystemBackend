@@ -285,7 +285,7 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
     async def receive(self, text_data=None, bytes_data=None):
         if not text_data:
             return
-
+    
         try:
             payload = json.loads(text_data)
         except json.JSONDecodeError:
@@ -298,7 +298,32 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 )
             )
             return
-
+    
+        if payload.get("type") == "motor_applied":
+            applied_state = bool(payload.get("motor_state", False))
+            set_motor_state(applied_state)
+            timestamp = datetime.now().isoformat()
+    
+            await self.channel_layer.group_send(
+                GROUP_UPDATES,
+                {
+                    "type": "motor_state_message",
+                    "motor_state": applied_state,
+                    "timestamp": timestamp,
+                },
+            )
+    
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "ack",
+                        "motor_state": applied_state,
+                        "timestamp": timestamp,
+                    }
+                )
+            )
+            return
+    
         if payload.get("type") == "request_motor_state":
             await self.send(
                 text_data=json.dumps(
@@ -310,7 +335,7 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 )
             )
             return
-
+    
         command = str(payload.get("command", "")).upper()
         if command not in {"ON", "OFF"}:
             await self.send(
@@ -322,11 +347,11 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 )
             )
             return
-
+    
         new_state = command == "ON"
         set_motor_state(new_state)
         timestamp = datetime.now().isoformat()
-
+    
         await self.channel_layer.group_send(
             GROUP_DEVICES,
             {
@@ -336,7 +361,7 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 "timestamp": timestamp,
             },
         )
-
+    
         await self.channel_layer.group_send(
             GROUP_UPDATES,
             {
@@ -345,7 +370,7 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 "timestamp": timestamp,
             },
         )
-
+    
         await self.send(
             text_data=json.dumps(
                 {
@@ -353,18 +378,6 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                     "command": command,
                     "motor_state": new_state,
                     "timestamp": timestamp,
-                }
-            )
-        )
-
-    async def motor_command_message(self, event):
-        await self.send(
-            text_data=json.dumps(
-                {
-                    "type": "motor_command",
-                    "command": event["command"],
-                    "motor_state": event["motor_state"],
-                    "timestamp": event["timestamp"],
                 }
             )
         )

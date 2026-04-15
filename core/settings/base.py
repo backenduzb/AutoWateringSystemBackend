@@ -20,7 +20,7 @@ INSTALLED_APPS = [
     
     'apps.auth.apps.AuthConfig',
     'apps.sensors.apps.SensorsConfig',
-    'apps.plants.apps.Plants',
+    'apps.plants.apps.PlantsConfig',
 ]
 
 MIDDLEWARE = [

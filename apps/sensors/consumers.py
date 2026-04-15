@@ -229,14 +229,44 @@ class SensorConsumer(AsyncWebsocketConsumer):
 
 class MotorControlConsumer(AsyncWebsocketConsumer):
     """Web client to ESP32 motor control (Dashboard dan boshqarish)"""
+    """ESP32 ham shu endpoint ga ulanishi mumkin (secret token bilan)"""
 
     async def connect(self):
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Avval user authentication tekshirish
         user = self.scope.get("user")
-        if not user or not getattr(user, "is_authenticated", False):
-            await self.close(code=4401)
-            return
+        is_authenticated = user and getattr(user, "is_authenticated", False)
+
+        # Agar user authenticate bo'lmagan bo'lsa, secret token tekshirish
+        if not is_authenticated:
+            query = parse_qs(self.scope.get("query_string", b"").decode("utf-8"))
+            secret = query.get("secret", [None])[0]
+            allowed = set(getattr(settings, "TELEMETRY_DEVICE_TOKENS", []))
+
+            if not secret or secret not in allowed:
+                logger.warning("❌ MotorControlConsumer: Authentication failed (no user or secret)")
+                await self.close(code=4401)
+                return
 
         await self.accept()
+        logger.info("✅ MotorControlConsumer: Client connected")
+
+        # ESP32 ni motor guruhiga qo'shish
+        query = parse_qs(self.scope.get("query_string", b"").decode("utf-8"))
+        secret = query.get("secret", [None])[0]
+        if secret and secret in set(getattr(settings, "TELEMETRY_DEVICE_TOKENS", [])):
+            # Bu ESP32 device - uni guruhga qo'shamiz
+            await self.channel_layer.group_add(ESP32_GROUP_NAME, self.channel_name)
+            logger.info(f"📡 ESP32 device joined '{ESP32_GROUP_NAME}' group")
+            # Joriy motor holatini yuborish
+            await self.send(text_data=json.dumps({
+                "type": "motor_state",
+                "state": get_motor_state()
+            }))
+        else:
+            logger.info("🌐 Web dashboard client connected (no ESP32 secret)")
 
     async def disconnect(self, code):
         pass
@@ -249,6 +279,14 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
             payload = json.loads(text_data)
         except json.JSONDecodeError:
             await self.send(text_data=json.dumps({"error": "invalid json"}))
+            return
+
+        # ESP32 dan motor state so'rovi
+        if payload.get("type") == "request_motor_state":
+            await self.send(text_data=json.dumps({
+                "type": "motor_state",
+                "state": get_motor_state()
+            }))
             return
 
         command = payload.get("command", "").upper()

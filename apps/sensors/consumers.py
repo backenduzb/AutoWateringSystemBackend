@@ -158,7 +158,14 @@ class SensorConsumer(AsyncWebsocketConsumer):
         try:
             payload = json.loads(text_data)
         except json.JSONDecodeError:
-            await self.send(text_data=json.dumps({"type": "error", "message": "invalid_json"}))
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "error",
+                        "message": "invalid_json",
+                    }
+                )
+            )
             return
 
         msg_type = payload.get("type")
@@ -169,10 +176,15 @@ class SensorConsumer(AsyncWebsocketConsumer):
 
         if msg_type == "motor_command":
             command = str(payload.get("command", "")).upper()
+
             if command not in {"ON", "OFF"}:
                 await self.send(
                     text_data=json.dumps(
-                        {"type": "error", "message": "invalid_command", "valid_commands": ["ON", "OFF"]}
+                        {
+                            "type": "error",
+                            "message": "invalid_command",
+                            "valid_commands": ["ON", "OFF"],
+                        }
                     )
                 )
                 return
@@ -194,20 +206,27 @@ class SensorConsumer(AsyncWebsocketConsumer):
             return
 
         raw_value = payload.get("value", payload.get("humidity"))
+
         try:
             value = float(raw_value)
         except (TypeError, ValueError):
-            await self.send(text_data=json.dumps({"type": "error", "message": "value_must_be_numeric"}))
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "error",
+                        "message": "value_must_be_numeric",
+                    }
+                )
+            )
             return
 
         source = (self.scope.get("client") or ["esp32"])[0]
         reading = await create_reading(value=value, source=source)
-        
+
         control = await get_control_snapshot()
         current_motor_state = await get_motor_state()
-        
         next_motor_state = current_motor_state
-        
+
         if (
             control["auto_mode"]
             and not control["manual_override"]
@@ -215,17 +234,20 @@ class SensorConsumer(AsyncWebsocketConsumer):
             and control["plant_id"] is not None
         ):
             soil_min = control["soil_min"]
-            soil_max = control["soil_max"]
-        
-            if soil_min is not None and value < soil_min:
-                next_motor_state = True
-            elif soil_max is not None and value >= soil_max:
-                next_motor_state = False
-        
+            stop_threshold = None
+
+            if soil_min is not None:
+                stop_threshold = soil_min + 5
+
+                if value < soil_min:
+                    next_motor_state = True
+                elif value >= stop_threshold:
+                    next_motor_state = False
+
             if next_motor_state != current_motor_state:
                 await set_motor_state(next_motor_state)
                 await self.broadcast_motor_state(next_motor_state)
-        
+
         out = {
             "type": "reading",
             "data": {
@@ -239,6 +261,7 @@ class SensorConsumer(AsyncWebsocketConsumer):
                 "plant_name": control["plant_name"],
                 "soil_min": control["soil_min"],
                 "soil_max": control["soil_max"],
+                "stop_threshold": control["soil_min"] + 5 if control["soil_min"] is not None else None,
             },
         }
 
@@ -332,17 +355,18 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
                 }
             )
         )
+
     async def motor_command_message(self, event):
-            await self.send(
-                text_data=json.dumps(
-                    {
-                        "type": "motor_command",
-                        "command": event["command"],
-                        "motor_state": event["motor_state"],
-                        "timestamp": event["timestamp"],
-                    }
-                )
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "motor_command",
+                    "command": event["command"],
+                    "motor_state": event["motor_state"],
+                    "timestamp": event["timestamp"],
+                }
             )
+        )
 
     async def disconnect(self, code):
         await self.channel_layer.group_discard(GROUP_DEVICES, self.channel_name)
@@ -354,7 +378,14 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
         try:
             payload = json.loads(text_data)
         except json.JSONDecodeError:
-            await self.send(text_data=json.dumps({"type": "error", "message": "invalid_json"}))
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "error",
+                        "message": "invalid_json",
+                    }
+                )
+            )
             return
 
         if payload.get("type") == "motor_applied":
@@ -395,8 +426,16 @@ class MotorControlConsumer(AsyncWebsocketConsumer):
             return
 
         command = str(payload.get("command", "")).upper()
+
         if command not in {"ON", "OFF"}:
-            await self.send(text_data=json.dumps({"type": "error", "message": "invalid_command"}))
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "error",
+                        "message": "invalid_command",
+                    }
+                )
+            )
             return
 
         new_state = command == "ON"

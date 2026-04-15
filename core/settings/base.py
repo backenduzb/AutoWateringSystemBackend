@@ -20,6 +20,7 @@ INSTALLED_APPS = [
     
     'apps.auth.apps.AuthConfig',
     'apps.sensors.apps.SensorsConfig',
+    'apps.plants.apps.Plants',
 ]
 
 MIDDLEWARE = [
@@ -55,6 +56,7 @@ TELEMETRY_DEVICE_TOKENS = [
 AUTH_USER_MODEL = "accounts.User"
 
 MIGRATION_MODULES = {
-    "accounts": "migrations2.accounts",
+    "accounts": "migrations.accounts",
     "sensors": "migrations.sensors",
+    "plants": "migrations.plants",
 }

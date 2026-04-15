@@ -5,7 +5,6 @@ set -e
 export DJANGO_SETTINGS_MODULE=core.settings
 
 echo "📦 Running migrations..."
-python manage.py makemigrations --noinput
 python manage.py migrate --noinput
 
 python manage.py createadmin

@@ -3,7 +3,7 @@
 set -e
 
 # Django settings modulini set qilish
-export DJANGO_SETTINGS_MODULE=core.settings.prod
+export DJANGO_SETTINGS_MODULE=core.settings
 
 echo "📦 Running migrations..."
 python manage.py makemigrations --noinput

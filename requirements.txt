@@ -13,7 +13,7 @@ daphne==4.2.1
 Django==6.0.2
 django-cors-headers==4.9.0
 django-filter==25.1
-djangorestframework==3.16.1
+djangorestframework==3.17.1
 djangorestframework_simplejwt==5.5.1
 et_xmlfile==2.0.0
 gunicorn==25.1.0
